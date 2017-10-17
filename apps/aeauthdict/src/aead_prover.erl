@@ -22,10 +22,12 @@
 %% API
 %%------------------------------------------------------------------------------
 -export([start_link/0,
+         stop/0,
          digest/0,
          perform/1,
          generate_proof/0,
-         unauthenticated_lookup/1]).
+         unauthenticated_lookup/1,
+         top_node_to_string/0]).
 
 %%------------------------------------------------------------------------------
 %% aead_agent behaviour callbacks
@@ -79,6 +81,10 @@
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
+-spec stop() -> ok.
+stop() ->
+    gen_server:stop(?SERVER).
+
 -spec digest() -> aead:digest().
 digest() ->
     gen_server:call(?SERVER, digest).
@@ -96,6 +102,10 @@ generate_proof() ->
 -spec unauthenticated_lookup(aead:key()) -> aead:success(aead:value()).
 unauthenticated_lookup(Key) ->
     gen_server:call(?SERVER, {unauthenticated_lookup, Key}).
+
+-spec top_node_to_string() -> string().
+top_node_to_string() ->
+    gen_server:call(?SERVER, top_node_to_string).
 
 %%%=============================================================================
 %%% aead_agent behaviour callbacks
@@ -202,15 +212,15 @@ replay_comparison(#{replay_index    := ReplayIndex,
 -spec init(_) -> {ok, prover_state()}.
 init(_) ->
     TopNode = top_node(),
-    {ok, #{top_node        => TopNode,
-           old_top_node    => TopNode,
-           directions      => [],
-           replay_index    => 0,
-           last_right_step => 0,
-           found           => false,
-           rootNodeHeight  => 0,
-           saved_node      => none,
-           callback_module => ?MODULE}}.
+    {ok, #{top_node         => TopNode,
+           old_top_node     => TopNode,
+           directions       => [],
+           replay_index     => 0,
+           last_right_step  => 0,
+           found            => false,
+           root_node_height => 0,
+           saved_node       => none,
+           callback_module  => ?MODULE}}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -225,7 +235,7 @@ handle_call(digest, _From, State) ->
 handle_call({perform, Operation}, _From, State) ->
     case perform(Operation, State) of
         {ok, {MaybeValue, State2}} ->
-            {reply, MaybeValue, State2};
+            {reply, {ok, MaybeValue}, State2};
         {error, _} = Error ->
             lager:error("Operation ~p failed: ~p", [Operation, Error]),
             {reply, Error, State}
@@ -235,7 +245,9 @@ handle_call(generate_proof, _From, State) ->
     {reply, Proof, State2};
 handle_call({unauthenticated_lookup, Key}, _From, State) ->
     Res = unauthenticated_lookup(Key, State),
-    {reply, Res, State}.
+    {reply, Res, State};
+handle_call(top_node_to_string, _From, #{top_node := TopNode} = State) ->
+    {reply, to_string(TopNode, 0), State}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -308,8 +320,8 @@ perform(Operation, #{directions := Directions,
                      top_node   := TopNode} = State) ->
     case aead_agent:perform(Operation, TopNode,
                             State#{replay_index => length(Directions)}) of
-        {ok, TopNode, MaybeValue, State2} ->
-            {ok, {MaybeValue, State2#{top_node => TopNode}}};
+        {ok, TopNode2, MaybeValue, State2} ->
+            {ok, {MaybeValue, State2#{top_node => TopNode2}}};
         {error, _} = Error ->
             %% if topNode is None, the line above will fail and nothing will change
             Error
@@ -469,3 +481,25 @@ unauthenticated_lookup(Node, Key, Found) ->
                     unauthenticated_lookup(aead:right(Node), Key, false)
             end
     end.
+
+%%------------------------------------------------------------------------------
+%% @doc
+%%    For debugging
+%% @end
+%%------------------------------------------------------------------------------
+-spec to_string(aead:verifier_node(), integer()) -> string().
+to_string(Node, Depth) ->
+    lists:duplicate(2 + Depth, 32) ++
+        case Node of
+            ?PROVER_LEAF ->
+                io_lib:format(
+                  "At leaf label = ~s key = ~s  nextLeafKey = ~s value = ~p~n",
+                  [base64:encode(aead:label(Node)), base64:encode(aead:key(Node)),
+                   base64:encode(aead:next_leaf_key(Node)), aead:value(Node)]);
+            ?PROVER_INTERNAL_NODE ->
+                io_lib:format(
+                  "Internal node label = ~s balance = ~p~n",
+                  [base64:encode(aead:label(Node)), aead:balance(Node)]) ++
+                    to_string(aead:left(Node), Depth + 1) ++
+                    to_string(aead:right(Node), Depth + 1)
+        end.

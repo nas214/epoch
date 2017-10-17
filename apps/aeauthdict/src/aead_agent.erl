@@ -174,30 +174,30 @@ perform(Operation, RootNode, #{callback_module := Mod} = State) ->
         %%    we don't change the tree, but simply return toDelete = true.
         %%    We then go in and delete using deleteHelper
 
-        {NewRootNode, _, HeightIncreased, ToDelete, OldValue} =
-            modify_helper(Mod, RootNode, Key, Operation),
+        {NewRootNode, _, HeightIncreased, ToDelete, OldValue, State3} =
+            modify_helper(Mod, RootNode, Key, Operation, State2),
 
         case ToDelete of
             true ->
-                {PostDeleteRootNode, HeightDecreased, State3} =
-                    delete_helper(Mod, NewRootNode, false, State2),
-                State4 = case HeightDecreased of
+                {PostDeleteRootNode, HeightDecreased, State4} =
+                    delete_helper(Mod, NewRootNode, false, State3),
+                State5 = case HeightDecreased of
+                             true ->
+                                 H = maps:get(root_node_height, State4),
+                                 State4#{root_node_height => H - 1};
+                             false ->
+                                 State4
+                         end,
+                {ok, PostDeleteRootNode, OldValue, State5};
+            false ->
+                State4 = case HeightIncreased of
                              true ->
                                  H = maps:get(root_node_height, State3),
-                                 State3#{root_node_height => H - 1};
+                                 State3#{root_node_height => H + 1};
                              false ->
                                  State3
                          end,
-                {PostDeleteRootNode, OldValue, State4};
-            false ->
-                State3 = case HeightIncreased of
-                             true ->
-                                 H = maps:get(root_node_height, State2),
-                                 State2#{root_node_height => H + 1};
-                             false ->
-                                 State2
-                         end,
-                {NewRootNode, OldValue, State3}
+                {ok, NewRootNode, OldValue, State4}
         end
     catch
         throw : Error ->
@@ -218,62 +218,64 @@ perform(Operation, RootNode, #{callback_module := Mod} = State) ->
 %%  We then go in and delete using deleteHelper
 %% @end
 %%------------------------------------------------------------------------------
--spec modify_helper(module(), aead:tree_node(), aead:key(), aead_operation:operation()) ->
+-spec modify_helper(module(), aead:tree_node(), aead:key(), aead_operation:operation(),
+                    state()) ->
                            {aead:tree_node(), ChangeHappened :: boolean(),
-                            HeightIncreased :: boolean(), ToDelete :: boolean(), aead:value()}.
-modify_helper(Mod, #{value := Value} = RootNode, Key, Operation) ->
+                            HeightIncreased :: boolean(), ToDelete :: boolean(), 
+                            aead:value(), state()}.
+modify_helper(Mod, #{value := Value} = RootNode, Key, Operation, State) ->
     %% leaf node
 
     %% Do not set the visited flag on the way down -- set it only after you
     %% know the operation did not fail, because if the operation failed,
     %% there is no need to put nodes in the proof.
     RootNodeVisited = RootNode#{visited => true},
-    case {Mod:key_matches_leaf(Key, RootNode), Operation} of
-        {true, {modification, Upd}} ->
+    case {Mod:key_matches_leaf(Key, RootNode, State), Operation} of
+        {{true, State2}, {modification, _Key, Upd}} ->
             case Upd({some, Value}) of
                 {ok, none} ->
                     %% delete key
-                    {RootNodeVisited, false, false, true, {some, Value}};
+                    {RootNodeVisited, false, false, true, {some, Value}, State2};
                 {ok, {some, NewValue}} ->
                     %% update value
                     %% TODO: check if value length has not changed
                     %% valueLengthOpt.foreach(vl => require(v.length == vl, s"Value length is fixed and should be $vl"))
                     NewRoot = aead:new(RootNodeVisited, #{value => NewValue}),
-                    {NewRoot, true, false, false, Value};
+                    {NewRoot, true, false, false, Value, State2};
                 {error, _} = Error ->
                     %% update function doesnt like the value we found
                     throw(Error)
             end;
-        {true, {lookup, _Upd}} ->
-            {RootNodeVisited, false, false, false, {some, Value}};
-        {false, {modification, Upd}} ->
+        {{true, State2}, {lookup, _Key, _Upd}} ->
+            {RootNodeVisited, false, false, false, {some, Value}, State2};
+        {{false, State2}, {modification, _Key, Upd}} ->
             case Upd(none) of
                 {ok, none} ->
                     %% don't change anything, just lookup
-                    {RootNodeVisited, false, false, false, none};
+                    {RootNodeVisited, false, false, false, none, State2};
                 {ok, {some, NewValue}} ->
                     %% insert some new value
                     %% TODO: check if value length has not changed
                     %% valueLengthOpt.foreach(vl => require(v.length == vl, s"Value length is fixed and should be $vl"))
                     {Mod:add_node(RootNodeVisited, Key, NewValue),
-                     true, true, false, none};
+                     true, true, false, none, State2};
                 {error, _} = Error ->
                     %% update function doesn't like that we found nothing
                     throw(Error)
             end;
-        {false, {lookup, _Upd}} ->
-            {RootNodeVisited, false, false, false, none}
+        {{false, State2}, {lookup, _Key, _Upd}} ->
+            {RootNodeVisited, false, false, false, none, State2}
     end;
-modify_helper(Mod, RootNode, Key, Operation) ->
+modify_helper(Mod, RootNode, Key, Operation, State) ->
     %% Internal node
 
     %% Go recursively in the correct direction
     %% Get a new node
     %% See if a single or double rotation is needed for AVL tree balancing
-    case Mod:next_direction_is_left(Key, RootNode) of
-        true ->
-            {NewLeft, ChangeHappened, ChildHeightIncreased, ToDelete, OldValue} =
-                modify_helper(Mod, aead:left(RootNode), Key, Operation),
+    case Mod:next_direction_is_left(Key, RootNode, State) of
+        {true, State2} ->
+            {NewLeft, ChangeHappened, ChildHeightIncreased, ToDelete, OldValue, State3} =
+                modify_helper(Mod, aead:left(RootNode), Key, Operation, State2),
             RootNodeVisited = RootNode#{visited => true},
 
             %% balance = ?BALANCE_L (-1) if left higher, ?BALANCE_R (+1) if left lower
@@ -293,30 +295,30 @@ modify_helper(Mod, RootNode, Key, Operation) ->
                                                           balance => ?BALANCE_0}),
                                     {aead:new(NewLeft, #{right   => NewRight,
                                                          balance => ?BALANCE_0}),
-                                     true, false, false, OldValue};
+                                     true, false, false, OldValue, State3};
                                 _ ->
                                     {double_right_rotate(RootNodeVisited, NewLeft,
                                                          aead:right(RootNode)),
-                                     true, false, false, OldValue}
+                                     true, false, false, OldValue, State3}
                             end;
                         {true, ?BALANCE_0} ->
                             %% no need to rotate
                             {aead:new(RootNodeVisited, #{left    => NewLeft,
                                                          balance => ?BALANCE_L}),
-                             true, true, false, OldValue};
+                             true, true, false, OldValue, State3};
                         {false, B} ->
                             {aead:new(RootNodeVisited, #{left    => NewLeft,
                                                          balance => B}),
-                             true, false, false, OldValue}
+                             true, false, false, OldValue, State3}
                     end;
                 false ->
                     %% no change happened
-                    {RootNodeVisited, false, false, ToDelete, OldValue}
+                    {RootNodeVisited, false, false, ToDelete, OldValue, State3}
             end;
-        false ->
+        {false, State2} ->
             %% next direction is right
-            {NewRight, ChangeHappened, ChildHeightIncreased, ToDelete, OldValue} =
-                modify_helper(Mod, aead:right(RootNode), Key, Operation),
+            {NewRight, ChangeHappened, ChildHeightIncreased, ToDelete, OldValue, State3} =
+                modify_helper(Mod, aead:right(RootNode), Key, Operation, State2),
             RootNodeVisited = RootNode#{visited => true},
 
             %% balance = ?BALANCE_L (-1) if left higher, ?BALANCE_R (+1) if left lower
@@ -337,29 +339,29 @@ modify_helper(Mod, RootNode, Key, Operation) ->
                                                            balance => ?BALANCE_0}),
                                     {aead:new(NewRight, #{left    => NewRight2,
                                                           balance => ?BALANCE_0}),
-                                     true, false, false, OldValue};
+                                     true, false, false, OldValue, State3};
                                 _ ->
                                     %% double left rotate
                                     {double_left_rotate(RootNodeVisited,
                                                         aead:left(RootNode), NewRight),
-                                     true, false, false, OldValue}
+                                     true, false, false, OldValue, State3}
                             end;
                         {true, ?BALANCE_0} ->
                             %% no need to rotate
                             {aead:new(RootNodeVisited, #{right   => NewRight,
                                                          balance => ?BALANCE_R}),
-                             true, true, false, OldValue};
+                             true, true, false, OldValue, State3};
                         {false, B} ->
                             {aead:new(RootNodeVisited, #{right   => NewRight,
                                                          balance => B}),
-                             true, false, false, OldValue}
+                             true, false, false, OldValue, State3}
                     end;
                 false ->
                     %% no change happened
-                    {RootNodeVisited, false, false, ToDelete, OldValue}
+                    {RootNodeVisited, false, false, ToDelete, OldValue, State3}
             end
     end.
-%% TODO: do we need label-only nodes?
+%% TODO: label-only nodes!
 
 %%------------------------------------------------------------------------------
 %% @doc
@@ -401,7 +403,7 @@ delete_helper(Mod, RootNode, DeleteMax, State) ->
             %% If the next step -- which is to the left -- is a leaf, then the value
             %% we are looking for is not a key of any internal node in the tree,
             %% which is impossible
-            throw({error, failede_to_delete});
+            throw({error, failed_to_delete});
         _ ->
             ok
     end,
@@ -423,8 +425,8 @@ delete_helper(Mod, RootNode, DeleteMax, State) ->
                     %% Otherwise, we really are deleting the leaf, and therefore
                     %% we need to change the nextLeafKey of its predecessor
                     Direction == 0 orelse throw({error, unexpected_direction}),
-                    {change_next_leaf_key_of_max_node(LeftChild,
-                                                      aead:next_leaf_key(RightChild)),
+                    {ok, change_next_leaf_key_of_max_node(LeftChild,
+                                                          aead:next_leaf_key(RightChild)),
                      true, State}
             end;
         {0, ?LEAF_NODE, _} ->
@@ -469,8 +471,8 @@ delete_helper(Mod, RootNode, DeleteMax, State) ->
                                     %% double left rotate
                                     %% I know rightChild.left is not a leaf, because rightChild
                                     %% has a higher subtree on the left
-                                    {double_left_rotate(aead:visit(NewRoot), NewLeft,
-                                                        aead:visit(RightChild)), true, State2};
+                                    {ok, double_left_rotate(aead:visit(NewRoot), NewLeft,
+                                                            aead:visit(RightChild)), true, State2};
                                 B ->
                                     %% single left rotate
                                     {NewLBalance, NewRBalance} =
@@ -482,19 +484,19 @@ delete_helper(Mod, RootNode, DeleteMax, State) ->
                                                             #{left    => NewLeft,
                                                               right   => aead:left(RightChild),
                                                               balance => NewLBalance}),
-                                    {aec:new(RightChild, #{left    => NewLeftChild,
-                                                           balance => NewRBalance}),
+                                    {ok, aec:new(RightChild, #{left    => NewLeftChild,
+                                                               balance => NewRBalance}),
                                      NewRBalance == ?BALANCE_0, State2}
                             end;
                         {true, ?BALANCE_0} ->
-                            {aead:new(NewRoot, #{left => NewLeft,
-                                                 balance => ?BALANCE_R}), false, State2};
+                            {ok, aead:new(NewRoot, #{left => NewLeft,
+                                                     balance => ?BALANCE_R}), false, State2};
                         {true, ?BALANCE_L} ->
-                            {aead:new(NewRoot, #{left => NewLeft,
-                                                 balance => ?BALANCE_0}), true, State2};
+                            {ok, aead:new(NewRoot, #{left => NewLeft,
+                                                     balance => ?BALANCE_0}), true, State2};
                         {false, B} ->
-                            {aead:new(NewRoot, #{left => NewLeft,
-                                                 balance => B}), B == ?BALANCE_0, State2}
+                            {ok, aead:new(NewRoot, #{left => NewLeft,
+                                                     balance => B}), B == ?BALANCE_0, State2}
                     end;
                 D when D > 0 ->
                     %% going right; know right child is not a leaf
@@ -517,8 +519,8 @@ delete_helper(Mod, RootNode, DeleteMax, State) ->
                                     RightOfLeftChild = aead:visit(aead:right(LeftChild)),
                                     NewLeftChild = aead:new(LeftChild,
                                                             #{right => RightOfLeftChild}),
-                                    {double_right_rotate(RootNode,
-                                                         aead:visit(NewLeftChild), NewRight),
+                                    {ok, double_right_rotate(RootNode,
+                                                             aead:visit(NewLeftChild), NewRight),
                                      true, State};
                                 ?BALANCE_0 ->
                                     %% single right rotate
@@ -526,8 +528,8 @@ delete_helper(Mod, RootNode, DeleteMax, State) ->
                                                              #{left    => aead:right(LeftChild),
                                                                right   => NewRight,
                                                                balance => ?BALANCE_L}),
-                                    {aead:new(LeftChild, #{right   => NewRightChild,
-                                                           balance => ?BALANCE_R}),
+                                    {ok, aead:new(LeftChild, #{right   => NewRightChild,
+                                                               balance => ?BALANCE_R}),
                                      false, State};
                                 ?BALANCE_L ->
                                     %% single right rotate
@@ -535,22 +537,22 @@ delete_helper(Mod, RootNode, DeleteMax, State) ->
                                                              #{left    => aead:right(LeftChild),
                                                                right   => NewRight,
                                                                balance => ?BALANCE_0}),
-                                    {aead:new(LeftChild, #{right   => NewRightChild,
-                                                           balance => ?BALANCE_0}),
+                                    {ok, aead:new(LeftChild, #{right   => NewRightChild,
+                                                               balance => ?BALANCE_0}),
                                      true, State}
                             end;
                         {true, ?BALANCE_0} ->
-                            {aead:new(RootNodeVisited,
-                                      #{right   => NewRight,
-                                        balance => ?BALANCE_L}), false, State};
+                            {ok, aead:new(RootNodeVisited,
+                                          #{right   => NewRight,
+                                            balance => ?BALANCE_L}), false, State};
                         {true, ?BALANCE_R} ->
-                            {aead:new(RootNodeVisited,
-                                      #{right   => NewRight,
-                                        balance => ?BALANCE_0}), true, State};
+                            {ok, aead:new(RootNodeVisited,
+                                          #{right   => NewRight,
+                                            balance => ?BALANCE_0}), true, State};
                         {false, B} ->
-                            {aead:new(RootNodeVisited,
-                                      #{right   => NewRight,
-                                        balance => B}), B == ?BALANCE_0, State}
+                            {ok, aead:new(RootNodeVisited,
+                                          #{right   => NewRight,
+                                            balance => B}), B == ?BALANCE_0, State}
                     end
             end
     end.
