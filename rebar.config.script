@@ -1,0 +1,7 @@
+Relx0 = lists:keyfind(relx, 1, CONFIG),
+{relx, [{release, {epoch, _}, Opts} | T]} = Relx0,
+{ok, Version} = file:read_file(<<"VERSION">>),
+%% the release should be in front
+Relx = {relx, [{release, {epoch, binary_to_list(Version)}, Opts}] ++ T},
+lists:keyreplace(relx, 1, CONFIG, Relx).
+
